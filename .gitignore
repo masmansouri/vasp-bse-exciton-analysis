@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.out
+*.log
+*.dat
+*.npy
+*.npz
+*.png
+*.pdf
+.env
+

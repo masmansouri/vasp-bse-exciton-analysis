@@ -1,3 +1,18 @@
+#!/usr/bin/env python3
+"""
+uniform_PARCHARGE.py
+VASP-5.4 compatible tool to build uniform FFT-based resampling PARCHG files
+ - PARCHG.<band>.<kpt> -> band-resolved |psi|^2 on FFT grid
+
+Outputs:
+ - constructs PARCHG.<band>.<kpt> with uniform grid nx = ny = nz
+
+Notes:
+ - Script expects PARCHG files named as standard VASP: 
+    if PARCHG.0193.0001 uses two loops: for iband/kkpoint in num_bands/num_kpoints.
+    if PARCHG.0193_ALLK runs over single loop:for iband in num_bands.
+"""
+
 import numpy as np
 
 # ---- FFT-based resampling ----
@@ -29,16 +44,23 @@ def fft_resample(data, new_shape):
         
         
 # ==========================
-# USER INPUT
+# INPUT 
 # ==========================
-mas=[228]
-for iband in range(193,243):
-    input_file  = "PARCHG.0{}.ALLK".format(iband)
-    output_file = "PARCHG.0{}_uniform".format(iband)
+
+num_bands = np.arange (100,140)
+num_kpoints= np.arange (1,5)
+new_grid = (200, 200, 200)   # (nx, ny, nz)
+
+for iband in num_bands:
+ for kkpoint in num_kpoints:
+    input_file  = "PARCHG.{iband:04d}.{kkpoint:04d}"
+    output_file = "PARCHG.{iband:04d}.{kkpoint:04d}_uniform"
+    #input_file  = "PARCHG.{:04d}.ALLK".format(iband)
+    #output_file = "PARCHG.{:04d}_uniform".format(iband)
+
+
     print(input_file,'-->', output_file)
-    new_grid = (200, 200, 200)   # (nx, ny, nz)
-
-
+    
 
     with open(input_file, "r") as f:
         lines = f.readlines()

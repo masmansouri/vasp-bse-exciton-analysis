@@ -3,20 +3,21 @@
 exciton_eh_analysis_VASP.py
 
 VASP-5.4 compatible tool to build exciton electron/hole densities from:
- - BSEFATBAND (text)   -> exciton coefficients / weights
+ - BSEFATBAND          -> exciton coefficients / weights
  - PARCHG.<band>.<kpt> -> band-resolved |psi|^2 on FFT grid
  - POSCAR              -> lattice + ionic positions (optional, used for auto molecule detection)
 
 Outputs:
- - prints centroid positions (cart, ang), separation (ang)
- - prints integrated electron/hole probability on molecular slab (CT fractions)
- - saves numpy arrays: rho_e.npy, rho_h.npy
+ - calculates centroid positions (cart, ang), separation (ang)
+ - calculates integrated electron/hole probability on molecular slab
+ - calculates root-mean-square (RMS) electron-hole separation
+ - saves electron and hole cube files, or numpy arrays: rho_e.npy, rho_h.npy
  - basic sanity checks
- - saves electron and hole cube files
+ - prints out a summary
 
 Notes:
- - Script expects PARCHG files named as standard VASP: e.g., PARCHG.0193.0001.
- - For slabs, periodicity is applied only in x,y when computing min-image separation.
+ - Script expects PARCHG files named as standard VASP: e.g., PARCHG.0193.0001, although it falls back similar patterns as well.
+ - For slabs, periodicity is applied only in x-y plane when computing min-image separation.
 """
 
 import os, re, glob, sys
@@ -25,79 +26,137 @@ from collections import OrderedDict
 ANG_TO_BOHR = 1.0 / 0.52917721092
 
 
-#EXCITON_INDEX = int(input("EXCITON_INDEX: "))
-WEIGHT_CUTOFF = 0.9                 # keep transitions until cumulative weight >= WEIGHT_CUTOFF
+#------------------------ INPUTS ------------------------#
+#--------------------------------------------------------#
+
+BSEFATBAND = "path/to/BSEFATBAND"     
+PARCHG_DIR = "path/to/PARCHGs"
+POSCAR = "path/to/POSCAR"
 
 
-# ------------------------ INPUTS ------------------------#
-BSEFATBAND = "../../../8-BSE_GW_HSE_60_15/BSEFATBAND"     
-PARCHG_DIR = "../"
-PARCHG_PATTERN = "PARCHG.{band:04d}.{k:04d}_uniform"  
-POSCAR = "../POSCAR"
-
+# keep transitions until cumulative weight >= WEIGHT_CUTOFF
+WEIGHT_CUTOFF = 0.9
 
 # to adjust molecular slab limits manually (Ang)
 MOL_Z_MIN = None
 MOL_Z_MAX = None
 
-# If auto-detect of molecule from POSCAR should look for topmost cluster separated by at least this gap (ang)
+# If auto-detect of molecule from POSCAR should look for topmost cluster separated by at least this gap (Ang)
 CLUSTER_GAP = 2.5
 
-# Which atoms are considered substrate candidates (to help cluster detection; adjust if needed)
-SUBSTRATE_ELEMENTS = set(["Si"])   # elements of substrate; used to separate clusters (optional)
-# -------------------------------------------------------------------------------
+#----------------------------------------------------------#
+#----------------------------------------------------------#
 
-
-
-
-def read_cell_from_poscar(poscar_path):
-    """Read lattice vectors from POSCAR. Returns 3x3 numpy array (A)."""
-    with open(poscar_path, 'r') as f:
-        lines = [l.rstrip() for l in f.readlines()]
-    if len(lines) < 5:
-        raise RuntimeError("POSCAR too short")
-    scale = float(lines[1].strip())
-    a1 = np.fromstring(lines[2], sep=' ')
-    a2 = np.fromstring(lines[3], sep=' ')
-    a3 = np.fromstring(lines[4], sep=' ')
-    cell = np.vstack([a1, a2, a3]) * scale
-    return cell
-
-
-def read_poscar_atoms(poscar_path):
-    """Return (elements_list, counts_list, frac_coords (N x 3) ) from POSCAR.
-    Works with VASP POSCAR standard where coordinates follow the header.
+def read_poscar(poscar):
     """
-    with open(poscar_path, 'r') as f:
-        lines = [l.rstrip() for l in f.readlines()]
-    scale = float(lines[1].strip())
-    cell = np.vstack([np.fromstring(lines[2], sep=' '),
-                     np.fromstring(lines[3], sep=' '),
-                     np.fromstring(lines[4], sep=' ')]) * scale
-    # elements and counts may be on lines 5 & 6 (two formats); detect
-    idx = 5
+    POSCAR reader (VASP 5 format).
+
+    Returns
+    -------
+    cell : (3,3) ndarray
+    atoms : list of (Z, cartesian_position)
+    elements : list[str]
+    counts : list[int]
+    frac_coords : (N,3) ndarray
+    cart_coords : (N,3) ndarray
+    """
+
+    ELEMENTS = ['X',
+    'H','He','Li','Be','B','C','N','O','F','Ne',
+    'Na','Mg','Al','Si','P','S','Cl','Ar','K','Ca',
+    'Sc','Ti','V','Cr','Mn','Fe','Co','Ni','Cu','Zn',
+    'Ga','Ge','As','Se','Br','Kr','Rb','Sr','Y','Zr',
+    'Nb','Mo','Tc','Ru','Rh','Pd','Ag','Cd','In','Sn',
+    'Sb','Te','I','Xe','Cs','Ba','La','Ce','Pr','Nd',
+    'Pm','Sm','Eu','Gd','Tb','Dy','Ho','Er','Tm','Yb',
+    'Lu','Hf','Ta','W','Re','Os','Ir','Pt','Au','Hg',
+    'Tl','Pb','Bi','Po','At','Rn','Fr','Ra','Ac','Th',
+    'Pa','U','Np','Pu','Am','Cm','Bk','Cf','Es','Fm',
+    'Md','No','Lr','Rf','Db','Sg','Bh','Hs','Mt','Ds',
+    'Rg','Cn','Nh','Fl','Mc','Lv','Ts','Og']
+
+    SYMBOL_TO_Z = {sym: i for i, sym in enumerate(ELEMENTS)}
+
+    with open(poscar, "r") as f:
+        lines = [l.strip() for l in f.readlines()]
+
+    if len(lines) < 8:
+        raise RuntimeError("POSCAR too short or malformed.")
+
+    # --- Lattice vectors ---
+    scale = float(lines[1])
+    cell = scale * np.array([
+        np.fromstring(lines[2], sep=" "),
+        np.fromstring(lines[3], sep=" "),
+        np.fromstring(lines[4], sep=" ")
+    ])
+
+    if cell.shape != (3, 3):
+        raise RuntimeError(f"Lattice vectors' shape invalid: {cell.shape}")
+
+    # --- Elements and counts ---
     toks5 = lines[5].split()
     toks6 = lines[6].split()
-    # If line 5 contains non-number -> element line
+
+    # VASP 5 format detection
     if any(not re.match(r'^-?\d+(\.\d+)?$', t) for t in toks5):
         elements = toks5
         counts = list(map(int, toks6))
         idx = 7
     else:
-        # VASP older style may have elements omitted; fallback: ask user
-        raise RuntimeError("POSCAR parsing: could not find element/count lines automatically. Provide POSCAR in standard format.")
-    # read fractional coordinates (Direct)
-    # find line with 'Direct' or 'Cartesian'
-    coord_start = idx
-    if lines[idx].lower().startswith("direct") or lines[idx].lower().startswith("cart"):
-        coord_start += 1
-    # total atoms:
+        raise RuntimeError("Only VASP 5 format with element symbols is supported.")
+
     nat = sum(counts)
-    frac = []
+
+    # --- Coordinate mode handling ---
+    line = lines[idx].lower()
+
+    if line.startswith("s"):   # Selective dynamics present
+        idx += 1
+        line = lines[idx].lower()
+
+    is_direct = line.startswith("d")
+    idx += 1
+
+    # --- Read coordinates ---
+    coords = []
     for i in range(nat):
-        frac.append(np.fromstring(lines[coord_start + i], sep=' ')[0:3])
-    frac = np.array(frac)
-    return elements, counts, frac, cell
+        vec = np.fromstring(lines[idx + i], sep=" ")[:3]
+        if vec.size != 3:
+            raise RuntimeError("Malformed atomic coordinate line.")
+        coords.append(vec)
+
+    coords = np.array(coords)
+
+    if coords.shape != (nat, 3):
+        raise RuntimeError("Coordinate array shape mismatch.")
+
+    # --- Convert coordinates ---
+    if is_direct:
+        frac = coords
+        cart_coords = frac @ cell
+    else:
+        cart_coords = coords
+        frac = cart_coords @ np.linalg.inv(cell)
+
+    # --- Atomic number mapping ---
+    atoms = []
+    atom_index = 0
+
+    for sp, n in zip(elements, counts):
+        if sp not in SYMBOL_TO_Z:
+            raise ValueError(f"Unknown element symbol: {sp}")
+
+        Z = SYMBOL_TO_Z[sp]
+
+        for _ in range(n):
+            atoms.append((Z, cart_coords[atom_index]))
+            atom_index += 1
+
+    # Final consistency check
+    assert atom_index == nat, "Atom counting mismatch."
+
+    return cell, atoms, elements, counts, frac, cart_coords
 
 
 
@@ -117,25 +176,26 @@ def read_cell_from_parchg(parchg_path):
 
 def find_parchg_file_for(band, k, dirpath=PARCHG_DIR):
     """Try to locate a PARCHG file for (band,k) using the configured pattern and fallbacks."""
+
+    PARCHG_PATTERN = "PARCHG.{band:04d}.{k:04d}"
+
     # first try primary pattern
     fname = os.path.join(dirpath, PARCHG_PATTERN.format(band=band, k=k))
     if os.path.exists(fname):
+        print("Reading {}.".format(fname))
         return fname
+    
     # try simple pattern without zero padding
     fname2 = os.path.join(dirpath, f"PARCHG.{band}.{k}")
     if os.path.exists(fname2):
+        print("Given path doesnot exist, now reading {}".format(fname2))
         return fname2
-    # try scanning files in dir and match by containing band and k as tokens
-    for f in os.listdir(dirpath):
-        if f.startswith("PARCHG") and f.find(str(band)) != -1 and f.find(str(k)) != -1:
-            # crude match; return first reasonable one
-            return os.path.join(dirpath, f)
+    
     # try fallback patterns
     FALLBACK_PATTERNS = [
+        "PARCHG.{band:04d}.{k:04d}_uniform",
         "PARCHG.{band}.{k}",
         "PARCHG.{band:03d}.{k:03d}",
-        "PARCHG.{band:04d}.{k:04d}.gz",  # if compressed (rare)
-        "{band:04d}.{k:04d}.PARCHG",
         "PARCHG.{band:04d}.{k:01d}"
     ]
     for pat in FALLBACK_PATTERNS:
@@ -144,7 +204,14 @@ def find_parchg_file_for(band, k, dirpath=PARCHG_DIR):
         except:
             continue
         if os.path.exists(pf):
+            print("Given path doesnot exist, now reading from {}".format(pf))
             return pf
+    
+    #try scanning files in dir and match by containing band and k as tokens
+    for f in os.listdir(dirpath):
+        if f.startswith("PARCHG") and f.find(str(band)) != -1 and f.find(str(k)) != -1:
+            print("Given path doesnot exist, now reading from {}".format(dirpath))
+            return os.path.join(dirpath, f)
     # no match
     return None
 
@@ -166,7 +233,8 @@ def parse_parchg_file(parchg_path):
             break
     if grid_idx is None:
         raise RuntimeError(f"Could not find grid dims in {parchg_path}")
-    print("nx, ny, nz",nx, ny, nz)
+    #print("nx, ny, nz",nx, ny, nz)
+
     # the density floats start at next line
     float_lines = lines[grid_idx+1:]
     # collect floats
@@ -179,7 +247,7 @@ def parse_parchg_file(parchg_path):
             except:
                 pass
     expected = nx * ny * nz
-    print("nx * ny * nz, len(floats) ",nx * ny * nz, len(floats))
+    #print("nx * ny * nz, len(floats) ",nx * ny * nz, len(floats))
     if len(floats) < expected:
         raise RuntimeError(f"PARCHG {parchg_path}: expected {expected} floats, found {len(floats)}")
     arr = np.array(floats[:expected], dtype=float)
@@ -194,7 +262,7 @@ def parse_bsefatband(bsefile, exciton_index):
     """
     Parse VASP 5.4 BSEFATBAND and extract transitions for a given exciton.
     1BSE eigenvalue    E_BSE      IP-eigenvalue:    E_IP
-    Kx Ky Kz E_v E_c Abs(X_BSE)/W_k NB_v NB_c Re(X_BSE)+ i*Im(X_BSE)
+    Kx, Ky, Kz, E_v, E_c, Abs(X_BSE)/W_k, NB_v, NB_c, Re(X_BSE)+ i*Im(X_BSE)
     Returns:
       transitions: list of dicts {v, c, k, weight}
       kmap: dict mapping k-vector -> k-index (1-based)
@@ -259,76 +327,14 @@ def parse_bsefatband(bsefile, exciton_index):
         "weight": r["weight"]
     } for r in raw]
 
-    return transitions, kmap
-
-
-def parse_bsefatband_by_A(bsefile, exciton_index):
-    """
-    Parse VASP 5.4 BSEFATBAND and extract transitions for a given exciton.
-    Returns:
-      transitions: list of dicts {v, c, k, weight}
-      kmap: dict mapping k-vector -> k-index (1-based)
-    """
-    with open(bsefile, 'r') as f:
-        lines = f.readlines()
-
-    exciton_count = 0
-    in_block = False
-    raw_entries = []
-    kvec_list = []
-
-    for line in lines:
-        if "BSE eigenvalue" in line:
-            exciton_count += 1
-            in_block = (exciton_count == exciton_index)
-            continue
-
-        if not in_block:
-            continue
-
-        nums = re.findall(r'[-+]?\d*\.\d+|[-+]?\d+', line)
-        if len(nums) < 8:
-            continue
-
-        try:
-            kx, ky, kz = map(float, nums[0:3])
-            weight = float(nums[5])
-            v = int(float(nums[6]))
-            c = int(float(nums[7]))
-        except ValueError:
-            continue
-
-        kvec = (round(kx, 8), round(ky, 8), round(kz, 8))
-        if kvec not in kvec_list:
-            kvec_list.append(kvec)
-
-        raw_entries.append({
-            "v": v,
-            "c": c,
-            "kvec": kvec,
-            "weight": weight
-        })
-
-    if not raw_entries:
-        raise RuntimeError(f"No transitions found for exciton {exciton_index}")
-
-    kmap = {kvec_list[i]: i + 1 for i in range(len(kvec_list))}
-
-    transitions = []
-    for e in raw_entries:
-        transitions.append({
-            "v": e["v"],
-            "c": e["c"],
-            "k": kmap[e["kvec"]],
-            "weight": e["weight"]
-        })
-    #print(transitions, kmap)
+    #print(transitions)
     return transitions, kmap
 
 
 def select_top_transitions(transitions, cutoff=WEIGHT_CUTOFF):
     """
     Select transitions contributing up to a fraction of the total exciton weight.
+    cutoff   : cumulative fraction of total weight (Re(X_BSE)+ i*Im(X_BSE))**2 
     """
 
     # positive-definite weights
@@ -364,7 +370,7 @@ def select_top_transitions(transitions, cutoff=WEIGHT_CUTOFF):
 def select_top_transitions_by_A(transitions, cutoff=WEIGHT_CUTOFF):
     """
     Select transitions contributing up to a fraction of the total exciton weight.
-    cutoff   : cumulative fraction of total weight to keep (e.g. 0.7)
+    cutoff   : cumulative fraction of total weight based Abs(X_BSE)/W_k values
     """
 
     weights = [abs(t["weight"]) for t in transitions]
@@ -393,8 +399,8 @@ def build_rho_eh(selected_transitions, cell, parchg_dir=PARCHG_DIR):
     """Accumulate rho_e and rho_h from PARCHG files using the selected transitions.
     Returns rho_e, rho_h arrays and grid shape and voxel fractional coordinates arrays.
     """
-    # first find one representative PARCHG to get grid shape and header cell if needed
-    # attempt to find first file
+    
+    # attempt to find PARCHG to get grid shape and header cell
     found_one = False
     sample_file = None
     for t in selected_transitions:
@@ -405,11 +411,13 @@ def build_rho_eh(selected_transitions, cell, parchg_dir=PARCHG_DIR):
             break
     if not found_one:
         raise RuntimeError("No PARCHG files found for any selected transitions. Check naming patterns.")
+    
     rho_sample, grid_shape = parse_parchg_file(sample_file)
     nx, ny, nz = grid_shape
     rho_e = np.zeros_like(rho_sample)
     rho_h = np.zeros_like(rho_sample)
     missing = []
+    
     for t in selected_transitions:
         v = t['v']; c = t['c']; k = t['k']; w = t['weight']
         fname_v = find_parchg_file_for(v, k, parchg_dir)
@@ -424,8 +432,10 @@ def build_rho_eh(selected_transitions, cell, parchg_dir=PARCHG_DIR):
             raise RuntimeError(f"Grid mismatch for files {fname_v} or {fname_c}")
         rho_h += w * rho_v
         rho_e += w * rho_c
+    
     if missing:
         print("Warning: missing PARCHG files for transitions (v,c,k):", missing)
+    
     # normalize to unit integral (probability)
     sum_h = rho_h.sum()
     sum_e = rho_e.sum()
@@ -465,10 +475,12 @@ def min_image_separation(r_e_cart, r_h_cart, cell, periodic=(True,True,False)):
     """Compute minimum-image vector r_e - r_h, applying periodic wrap only on axes flagged True."""
     # convert cart to fractional coordinates
     inv_cell = np.linalg.inv(cell.T)  # maps cart -> fractional when using row-vector * cell
-    # careful: we used r = frac @ cell earlier, so mapping back is frac = r @ inv_cell
+
+    # warning: r = frac @ cell used earlier, so mapping back is frac = r @ inv_cell
     r_e_frac = r_e_cart @ inv_cell
     r_h_frac = r_h_cart @ inv_cell
     delta = r_e_frac - r_h_frac
+
     # apply minimum image on periodic axes only (x,y)
     for i in range(3):
         if periodic[i]:
@@ -479,24 +491,25 @@ def min_image_separation(r_e_cart, r_h_cart, cell, periodic=(True,True,False)):
 
 
 def detect_molecule_zrange_from_poscar(poscar, gap_threshold=CLUSTER_GAP):
-    """Heuristic cluster detection: read POSCAR atoms, cluster by z coordinate gaps, return zmin,zmax of top cluster."""
+    """read POSCAR atoms, partition by z coordinate gaps, return zmin,zmax of top adsorbate distribution."""
     try:
-        elements, counts, frac, cell = read_poscar_atoms(poscar)
+        cell, atoms, elements, counts, frac, cart_coords = read_poscar(poscar)
     except Exception as e:
         print("Auto-detect molecule: failed to parse POSCAR:", e)
         return None, None
-    # compute cart z positions
-    cart = frac @ cell
-    z = cart[:,2]
-    # sort by z
+
+    z = cart_coords[:,2]
     order = np.argsort(z)
     z_sorted = z[order]
+
     # find big gaps
     diffs = np.diff(z_sorted)
     if (diffs.max() >  gap_threshold):
         msg = 'The difference in layers hight {:.3f} is larger than the given gap_threshold = {}'.format(diffs.max(), gap_threshold)
+
     # cluster edges where diffs > gap_threshold
     split_idx = np.where(diffs > gap_threshold)[0]
+    
     # clusters boundaries
     clusters = []
     start = 0
@@ -647,168 +660,6 @@ def rms_eh_separation(rho_e, rho_h, cell):
 
 
 
-def read_poscar_atoms(poscar):
-    """Return (elements_list, counts_list, frac_coords (N x 3) ) from POSCAR.
-    Works with VASP POSCAR standard where coordinates follow the header.
-    """
-    with open(poscar, 'r') as f:
-        lines = [l.rstrip() for l in f.readlines()]
-    scale = float(lines[1].strip())
-    cell = np.vstack([np.fromstring(lines[2], sep=' '),
-                     np.fromstring(lines[3], sep=' '),
-                     np.fromstring(lines[4], sep=' ')]) * scale
-    # elements and counts may be on lines 5 & 6 (two formats); detect
-    idx = 5
-    toks5 = lines[5].split()
-    toks6 = lines[6].split()
-    # If line 5 contains non-number -> element line
-    if any(not re.match(r'^-?\d+(\.\d+)?$', t) for t in toks5):
-        elements = toks5
-        counts = list(map(int, toks6))
-        idx = 7
-    else:
-        # VASP older style may have elements omitted; fallback: ask user
-        raise RuntimeError("POSCAR parsing: could not find element/count lines automatically. Provide POSCAR in standard format.")
-    # read fractional coordinates (Direct)
-    # find line with 'Direct' or 'Cartesian'
-    coord_start = idx
-    if lines[idx].lower().startswith("direct") or lines[idx].lower().startswith("cart"):
-        coord_start += 1
-    # total atoms:
-    nat = sum(counts)
-    frac = []
-    for i in range(nat):
-        frac.append(np.fromstring(lines[coord_start + i], sep=' ')[0:3])
-    frac = np.array(frac)
-    return elements, counts, frac, cell
-
-
-def read_poscar_atoms2(poscar):
-    """
-    Returns: lattice, list of (Z, position_cartesian)
-    """
-    ELEMENTS = ['X',  # Ghost
-    'H' , 'He', 'Li', 'Be', 'B' , 'C' , 'N' , 'O' , 'F' , 'Ne',
-    'Na', 'Mg', 'Al', 'Si', 'P' , 'S' , 'Cl', 'Ar', 'K' , 'Ca',
-    'Sc', 'Ti', 'V' , 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Zn',
-    'Ga', 'Ge', 'As', 'Se', 'Br', 'Kr', 'Rb', 'Sr', 'Y' , 'Zr',
-    'Nb', 'Mo', 'Tc', 'Ru', 'Rh', 'Pd', 'Ag', 'Cd', 'In', 'Sn',
-    'Sb', 'Te', 'I' , 'Xe', 'Cs', 'Ba', 'La', 'Ce', 'Pr', 'Nd',
-    'Pm', 'Sm', 'Eu', 'Gd', 'Tb', 'Dy', 'Ho', 'Er', 'Tm', 'Yb',
-    'Lu', 'Hf', 'Ta', 'W' , 'Re', 'Os', 'Ir', 'Pt', 'Au', 'Hg',
-    'Tl', 'Pb', 'Bi', 'Po', 'At', 'Rn', 'Fr', 'Ra', 'Ac', 'Th',
-    'Pa', 'U' , 'Np', 'Pu', 'Am', 'Cm', 'Bk', 'Cf', 'Es', 'Fm',
-    'Md', 'No', 'Lr', 'Rf', 'Db', 'Sg', 'Bh', 'Hs', 'Mt', 'Ds',
-    'Rg', 'Cn', 'Nh', 'Fl', 'Mc', 'Lv', 'Ts', 'Og']
-
-    SYMBOL_TO_Z = {sym: i for i, sym in enumerate(ELEMENTS)}
-
-    with open(poscar) as f:
-        lines = f.readlines()
-
-    scale = float(lines[1].strip())
-    a1 = np.fromstring(lines[2], sep=" ")
-    a2 = np.fromstring(lines[3], sep=" ")
-    a3 = np.fromstring(lines[4], sep=" ")
-
-    lattice = scale * np.vstack([a1, a2, a3])
-    f.close()
-
-    with open(poscar) as f:
-        lines = [l.strip() for l in f.readlines()]
-
-    scale = float(lines[1])
-    lattice = scale * np.array([
-        list(map(float, lines[2].split())),
-        list(map(float, lines[3].split())),
-        list(map(float, lines[4].split()))
-    ])
-
-    species = lines[5].split()
-    counts = list(map(int, lines[6].split()))
-
-    coord_mode = lines[7].lower()
-    is_direct = coord_mode.startswith("d")
-
-    pos_start = 8
-    positions = []
-
-    for n in counts:
-        for _ in range(n):
-            positions.append(list(map(float, lines[pos_start].split()[:3])))
-            pos_start += 1
-
-    positions = np.array(positions)
-
-    if is_direct:
-        positions = positions @ lattice  # fractional �~F~R Cartesian
-
-    # map species to atomic numbers
-    atoms = []
-    idx = 0
-
-    for sp, n in zip(species, counts):
-        if sp not in SYMBOL_TO_Z:
-            raise ValueError(f"Unknown element symbol: {sp}")
-
-        Z = SYMBOL_TO_Z[sp]
-
-        for _ in range(n):
-            atoms.append((Z, positions[idx]))
-            idx += 1
-
-    return lattice, atoms
-
-
-
-def cube_voxel_vectors(lattice, grid):
-    nx, ny, nz = grid
-    vx = lattice[0] / nx
-    vy = lattice[1] / ny
-    vz = lattice[2] / nz
-    return vx, vy, vz
-
-
-
-def write_cube0(filename, rho, lattice, atoms=None, origin=None):
-    """
-    lattice: 3x3 array in ang
-    rho: 3D density array
-    """
-
-    nx, ny, nz = rho.shape
-
-    if origin is None:
-        origin = np.zeros(3)
-    if atoms is None:
-        atoms = []
-
-    # convert lattice to Bohr
-    lattice_bohr = lattice * ANG_TO_BOHR
-    origin_bohr = origin * ANG_TO_BOHR
-
-    # voxel vectors (Bohr!)
-    vx = lattice_bohr[0] / nx
-    vy = lattice_bohr[1] / ny
-    vz = lattice_bohr[2] / nz
-
-    with open(filename, "w") as f:
-        f.write("Exciton density\n")
-        f.write("Generated from VASP BSE\n")
-
-
-        f.write(f"{len(atoms):5d} {origin_bohr[0]:12.6f} {origin_bohr[1]:12.6f} {origin_bohr[2]:12.6f}\n")
-        f.write(f"{nx:5d} {vx[0]:12.6f} {vx[1]:12.6f} {vx[2]:12.6f}\n")
-        f.write(f"{ny:5d} {vy[0]:12.6f} {vy[1]:12.6f} {vy[2]:12.6f}\n")
-        f.write(f"{nz:5d} {vz[0]:12.6f} {vz[1]:12.6f} {vz[2]:12.6f}\n")
-
-        for Z, pos in atoms:
-            pos_bohr = pos * ANG_TO_BOHR
-            f.write(f"{Z:5d} 0.0 {pos_bohr[0]:12.6f} {pos_bohr[1]:12.6f} {pos_bohr[2]:12.6f}\n")
-
-        flat = rho.flatten(order="F")
-        for i in range(0, len(flat), 6):
-            f.write(" ".join(f"{x:13.5e}" for x in flat[i:i+6]) + "\n")
 
 def write_cube(filename, rho, lattice, atoms=None, origin=None):
     """
@@ -830,7 +681,7 @@ def write_cube(filename, rho, lattice, atoms=None, origin=None):
         atoms = []
 
     nx, ny, nz = rho.shape
-    print("CUBE nx, ny, nz", nx, ny, nz)
+    #print("CUBE nx, ny, nz", nx, ny, nz)
 
     # convert lattice to Bohr
     lattice_bohr = lattice * ANG_TO_BOHR
@@ -862,37 +713,38 @@ def write_cube(filename, rho, lattice, atoms=None, origin=None):
 
 
 # ---------------------- Main driver ----------------------
-def run(EXCITON_INDEX, fileout):
-    EXCITON_INDEX=EXCITON_INDEX
+def main(EXCITON_INDEX):
+
     OUTPREFIX = "exciton"+str(EXCITON_INDEX)
-    with open(fileout, "w") as f:
-        f.write("Exciton {}\n".format(EXCITON_INDEX))
+    
+    with open(OUTPREFIX+".out", "w") as f:
         f.write("******************************\n")
+        f.write("Exciton {}\n".format(EXCITON_INDEX))
+        f.write("******************************\n\n")
+
 
         if not os.path.exists(BSEFATBAND):
             f.write("Error: BSEFATBAND file not found at {}\n".format(BSEFATBAND))
             sys.exit(1)
-
         f.write("Parsing BSEFATBAND...\n")
         transitions_all, kmap = parse_bsefatband(BSEFATBAND, exciton_index=EXCITON_INDEX)
         f.write("Found {}!\n".format(len(transitions_all)))
 
+
         # select top transitions by weight
         selected = select_top_transitions(transitions_all, cutoff=WEIGHT_CUTOFF)
-        f.write("Selected {}.\n".format(len(selected)))
-        f.write("Dominant transitions (cumulative weight >= {:.0f}%) \n".format(WEIGHT_CUTOFF*100))
-
-
-            # show top contributors
+        f.write("Selected {}.\n\n".format(len(selected)))
+        f.write("Dominant transitions (cumulative weight >= {:.0f}%): \n".format(WEIGHT_CUTOFF*100))
+        # write top contributors
         for t in selected:
             f.write("{}-->{} at K {}, Re(BSE)+ Im(BSE) {}, and Abs(BSE)/Wk {}.\n".format(t['v'],t['c'], t['k'],t['weight'], t['A']))
-
         f.write("\n\n")
+
 
         # read cell from POSCAR if exists, else try a PARCHG sample
         if os.path.exists(POSCAR):
-            cell = read_cell_from_poscar(POSCAR)
-            f.write("Read cell from POSCAR.\n")
+            cell, atoms, elements, counts, frac, cart_coords = read_poscar(POSCAR)
+            f.write("Reading POSCAR.\n")
         else:
             # try to find any PARCHG file to read its header cell
             fallback = None
@@ -906,10 +758,17 @@ def run(EXCITON_INDEX, fileout):
             cell = read_cell_from_parchg(fallback)
             f.write("Read cell from {}.\n\n".format(fallback))
 
+
         # build densities
         f.write("Building rho_e and rho_h from PARCHG files (this can be slow for many transitions)...\n")
         rho_e, rho_h, grid_shape = build_rho_eh(selected, cell, parchg_dir=PARCHG_DIR)
+        nx, ny, nz = grid_shape
+        if not (nx == ny == nz):
+            f.write("WARNING: grid mismatch nx={nx}, ny={ny}, nz={nz} can cause error in the final cube prints.")
         f.write("rho arrays shape: {} \n\n".format(rho_e.shape))
+        f.write("Sanity checks:\n")
+        f.write("  rho_e integral (should be 1):{}\n".format(rho_e.sum()))
+        f.write("  rho_h integral (should be 1):{}\n\n".format(rho_h.sum()))
 
 
         # compute centroids
@@ -920,8 +779,14 @@ def run(EXCITON_INDEX, fileout):
         f.write("Centroid hole     (cart): {}\n".format(np.array2string(r_h, precision=4)))
         f.write("Electron-hole separation (Ang, min-image xy): {}\n\n".format(round(dist,4)))
 
+        # expected scales:
+        approx_exciton_radius = dist
+        max_allowed = max(np.linalg.norm(cell[0]), np.linalg.norm(cell[1])) * 0.9
+        if approx_exciton_radius > max_allowed:
+            f.write("  Warning: computed separation is large (>{:.1f} Ang). Check PARCHG grid, cell, or minimum-image handling.".format(max_allowed),"\n")
 
-        # determine molecule slab z-range
+
+        # molecule/surface partition
         global MOL_Z_MIN, MOL_Z_MAX
         if MOL_Z_MIN is None or MOL_Z_MAX is None:
             if os.path.exists(POSCAR):
@@ -932,7 +797,7 @@ def run(EXCITON_INDEX, fileout):
                 if msg:
                     f.write(msg)
                 MOL_Z_MIN = zmin; MOL_Z_MAX = zmax
-                f.write("\nAuto-detected molecular slab z-range (Ang):{:.4f}, {:.4f}\n".format(MOL_Z_MIN, MOL_Z_MAX))
+                f.write("\nAuto-detected molecule/surface z-range (Ang):{:.4f}, {:.4f}\n".format(MOL_Z_MIN, MOL_Z_MAX))
             else:
                 f.write("\nNo POSCAR found and MOL_Z_MIN/MOL_Z_MAX not set. Please set them in the script.\n")
                 sys.exit(1)
@@ -955,40 +820,34 @@ def run(EXCITON_INDEX, fileout):
         ct_ind_z = ct_index_z(rho_e, rho_h, cell, z0, z_window=None)
         f.write("Z-resolved CT index for z0={:.4f}: {}\n".format(z0 , ct_ind_z))
         rms_eh = rms_eh_separation(rho_e, rho_h, cell)
-        f.write("RMS electron-hole separation: {}\n\n\n".format(rms_eh))
+        f.write("RMS electron-hole separation: {}\n\n".format(rms_eh))
+
 
         # save arrays
         #np.save(f"{OUTPREFIX}_rho_e.npy", rho_e)
         #np.save(f"{OUTPREFIX}_rho_h.npy", rho_h)
         #f.write("Saved {}.\n".format(OUTPREFIX + "_rho_e.npy and _rho_h.npy"))
-        # basic sanity checks
-        f.write("Sanity checks:\n")
-        f.write("  rho_e integral (should be 1):{}\n".format(rho_e.sum()))
-        f.write("  rho_h integral (should be 1):{}\n\n\n".format(rho_h.sum()))
-
-        # expected scales:
-        approx_exciton_radius = dist
-        max_allowed = max(np.linalg.norm(cell[0]), np.linalg.norm(cell[1])) * 0.9
-        if approx_exciton_radius > max_allowed:
-            f.write("  Warning: computed separation is large (>{:.1f} Ang). Check PARCHG grid, cell, or minimum-image handling.".format(max_allowed),"\n")
-        # final summary
-        f.write("\nSummary:")
-        f.write(f"  \n Exciton {EXCITON_INDEX}: separation = {dist:.3f} Ang, electron@molecule={q_e_mol:.3f}, hole@molecule={q_h_mol:.3f}")
-        f.write("\n Done!\n\n")
-
 
 
         # save cubes
         #rho_e = np.load("excitonS_rho_e.npy")
         #rho_h = np.load("excitonS_rho_h.npy")
-        lattice, atoms = read_poscar_atoms2(POSCAR)
-        write_cube(OUTPREFIX +"_electron.cube", rho_e, lattice, atoms)
-        write_cube(OUTPREFIX +"_hole.cube", rho_h, lattice, atoms)
-        f.write("\n\nCube files of e h saved!\n")
+        cell, atoms, elements, counts, frac, cart_coords = read_poscar(POSCAR)
+        write_cube(OUTPREFIX +"_electron.cube", rho_e, cell, atoms)
+        write_cube(OUTPREFIX +"_hole.cube", rho_h, cell, atoms)
+        f.write("Cube files of e h saved!\n\n")
+
+
+        # summary
+        f.write("Summary:")
+        f.write(f"  \n Exciton {EXCITON_INDEX}: electron@molecule={q_e_mol:.3f}, hole@molecule={q_h_mol:.3f}")
+        f.write(f"  \n Exciton {EXCITON_INDEX}: centroid separation = {dist:.3f} Ang, RMS electron-hole separation = {rms_eh:.3f} Ang.")
+        f.write("\n Done!")
         f.close()
 
+
+
 if __name__ == "__main__":
-    for i in range(1, 201):
+    for i in range(1,10):
         EXCITON_INDEX = i
-        fileout = "exc_"+str(EXCITON_INDEX)+".out"
-        run(EXCITON_INDEX, fileout)
+        main(EXCITON_INDEX)

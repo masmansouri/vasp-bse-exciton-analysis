@@ -1,21 +1,21 @@
-# VASP GW/BSE Exciton Analysis Tools
+# Post-processing Analysis of GW/BSE Excitons in VASP
 
 Python tools for post-processing excitonic properties obtained from
-GW/BSE calculations in VASP.
+$GW$/BSE calculations in VASP 5.4.
 
-The code reconstructs real-space electron and hole densities from
-BSE solutions and computes the following quantitative descriptors in hybrid molecule/2D interfaces.
+The code reconstructs real-space electron and hole densities from BSE solutions 
+and computes the following quantitative descriptors:
 
 - electron and hole density reconstruction
 - exciton centroid calculation
-- electron–hole separation
+- electron-hole separation
+- adsorbate localization probabilities (for hybrid molecule/2D interfaces)
 - RMS exciton size
-- molecular localization probabilities
 
 
 ## Scientific background
 
-The electron and hole densities are defined as $\rho_{e/h}(\mathbf{r}) = \sum_{v c} \left| w_{vc} \right|^2 \left| \psi_{c/v}(\mathbf{r}) \right|^2$, 
+The electron and hole densities are defined as $\rho_{e/h}(\mathbf{r}) = \sum_{v c} \left| w_{vc} \right|^2 ~~ \left| \psi_{c/v}(\mathbf{r}) \right|^2$, 
 where $w_{vc}$ are  the normalized weight of the transition $v\rightarrow c$ and $\psi_{c/v}(\mathbf{r})$ are eigenfunctions.
 From these densities, the code computes
 
@@ -23,7 +23,7 @@ From these densities, the code computes
 
 $$
 \langle \mathbf{r}_{e/h} \rangle =
-\int \mathbf{r} \rho_{e/h}(\mathbf{r}) d\mathbf{r}
+\int \mathbf{r} \rho_{e/h}(\mathbf{r})~d\mathbf{r}
 $$
 
 - **centroid separation**, measuring the spatial separation between the electron and hole centroids
@@ -36,8 +36,16 @@ $$
 \right|
 $$
 
+- **Molecular localization probability**, describing the probability of finding the electron or hole on the molecular adsorbate in hybrid molecule/2D interfaces 
 
-- **RMS electron–hole distance** as a descriptor of electron–hole overlap and spatial delocalization, defined as the root-mean-square separation
+$$
+P_{e/h}^{\mathrm{~mol}} =
+\int_{~\Omega_{\mathrm{mol}}}
+\rho_{e/h}(\mathbf{r})~ d\mathbf{r}.
+$$
+
+
+- **RMS electron-hole distance** as a descriptor of electron-hole overlap and spatial delocalization, defined as the root-mean-square separation
 
 $$
 d_{\mathrm{RMS}} =
@@ -45,18 +53,10 @@ d_{\mathrm{RMS}} =
 \left\langle r_e^2 \right\rangle +
 \left\langle r_h^2 \right\rangle -
 2 \langle \mathbf{r}_e \rangle \cdot \langle \mathbf{r}_h \rangle
-}, \mathrm{with} \left\langle r_{e/h}^2 \right\rangle =
-\int r^2 \rho_{e/h}(\mathbf{r})\, d\mathbf{r}.
+}, ~~~\mathrm{with} \left\langle r_{e/h}^2 \right\rangle =
+\int r^2 \rho_{e/h}(\mathbf{r})~ d\mathbf{r}.
 $$
 
-
-- **Molecular localization probability**, describing the probability of finding the electron or hole on the molecular adsorbate
-
-$$
-P_{e/h}^{\mathrm{mol}} =
-\int_{\Omega_{\mathrm{mol}}}
-\rho_{e/h}(\mathbf{r}) d\mathbf{r}.
-$$
 
 These quantities allow classification of excitons into localized/charge transfer excitons
 and help rationalize substrate-induced screening effects. Particularly, Small $d_{RMS}$ indicates 
@@ -75,9 +75,9 @@ git clone https://github.com/masmansouri/vasp-bse-exciton-analysis.git
 ## Usage
 The script requires the following input files from a GW/BSE calculation in VASP:
 
-- **POSCAR** – atomic structure used to identify the substrate and molecular region  
-- **BSEFATBAND** – contains the BSE eigenvectors (transition weights) for each exciton  
-- **PARCHG files** – band- and k-resolved charge densities contributing to the exciton transitions  
+- **POSCAR** -- atomic structure used to identify the substrate and molecular region  
+- **BSEFATBAND** -- contains the BSE eigenvectors (transition weights) for each exciton  
+- **PARCHG files** -- band- and $k$-resolved charge densities contributing to the exciton transitions  
 
 The code reconstructs real-space **electron and hole densities** associated with a selected exciton.
 
@@ -101,9 +101,9 @@ For each exciton analyzed, the code produces:
 
 #### Notes:
 
-The code attempts to automatically determine the molecular region along the z-direction by identifying the topmost atoms relative to the surface.
+For hybrid molecule/2D interfaces, the code attempts to automatically determine the molecular region along the $z$-direction by identifying the topmost atoms relative to the surface.
 This detection can be adjusted with:
-- `CLUSTER_GAP`as a vertical separation threshold (Ang) between surface and adsorbate.
+- `CLUSTER_GAP` as a vertical separation threshold (Ang) between surface and adsorbate.
 - `MOL_Z_MIN`, `MOL_Z_MAX` as manual limits defining the molecular region.
 
 If the PARCHG grids are not uniform, it is recommended to first generate FFT-based uniform grids.
